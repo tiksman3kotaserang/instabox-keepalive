@@ -1,0 +1,112 @@
+name: InstaBox keepalive
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'check = exec + report only; rotate = exec + force suspend-resume rotation'
+        required: false
+        default: 'check'
+        type: choice
+        options:
+          - check
+          - rotate
+
+permissions:
+  contents: read
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      INSTABOX_API_KEY: ${{ secrets.INSTABOX_API_KEY }}
+      MACHINE_ID: m_agqykepoj5i5vrfkw4w2z2exum
+      MACHINE_NAME: hermes
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Keepalive and optional rotation
+        env:
+          MODE: ${{ inputs.mode || 'check' }}
+        run: |
+          set -u
+          MODE="${MODE:-check}"
+          API="https://api.instabox.sh/v1/machines/${MACHINE_ID}"
+          echo "mode=$MODE machine=$MACHINE_NAME ($MACHINE_ID)"
+          get_machine() {
+            local code
+            code=$(curl -sS -H "X-API-Key: $INSTABOX_API_KEY" "$API" -o machine.json -w '%{http_code}')
+            echo "GET machine HTTP $code"
+            echo "state=$(jq -r '.state // "unknown"' machine.json)"
+            echo "machine_keys=$(jq -r 'keys_unsorted | join(",")' machine.json)"
+            echo "runtime_keys=$(jq -r '(.runtime // {}) | keys_unsorted | join(",")' machine.json)"
+            echo "autoSuspendAfterSeconds=$(jq -r '.autoSuspendAfterSeconds // "null"' machine.json)"
+            echo "maxRunMinutes=$(jq -r '.maxRunMinutes // "null"' machine.json)"
+            echo "autoSuspendedAt=$(jq -r '.autoSuspendedAt // "null"' machine.json)"
+            echo "cooldownUntil=$(jq -r '.cooldownUntil // "null"' machine.json)"
+          }
+          wait_running() {
+            local i state
+            for i in $(seq 1 20); do
+              get_machine
+              state=$(jq -r '.state // "unknown"' machine.json)
+              if [ "$state" = "running" ]; then echo "machine is running"; return 0; fi
+              echo "waiting for running (attempt $i/20, state=$state)"
+              sleep 15
+            done
+            echo "machine did not reach running in time" >&2
+            return 1
+          }
+          run_exec() {
+            echo "--- exec keepalive on $MACHINE_NAME ---"
+            npx -y instabox@latest exec "$MACHINE_NAME" -- bash -c 'date -u +%Y-%m-%dT%H:%M:%SZ; uptime; echo keepalive-ok'
+          }
+          get_machine
+          STATE=$(jq -r '.state // "unknown"' machine.json)
+          if [ "$STATE" = "suspended" ]; then
+            echo "machine is suspended; resuming before exec"
+            curl -sS -X POST "$API/resume" -H "X-API-Key: $INSTABOX_API_KEY" -H "Idempotency-Key: keepalive-${GITHUB_RUN_ID}-resume-before-exec" -o resume.json -w 'resume HTTP %{http_code}\n'
+            cat resume.json; echo
+            wait_running
+          fi
+          RUN_START=""; RUN_FIELD=""; AGE_MIN=""
+          for f in runStartedAt startedAt resumedAt lastResumedAt lastStartedAt runtime.startedAt runtime.runStartedAt; do
+            v=$(jq -r ".${f} // empty" machine.json)
+            if [ -n "$v" ]; then RUN_START="$v"; RUN_FIELD="$f"; break; fi
+          done
+          if [ -n "$RUN_START" ]; then
+            NOW=$(date +%s)
+            START_EPOCH=$(date -d "$RUN_START" +%s 2>/dev/null || echo "")
+            if [ -n "$START_EPOCH" ]; then
+              AGE_MIN=$(( (NOW - START_EPOCH) / 60 ))
+              echo "run_start_field=$RUN_FIELD run_start=$RUN_START run_age_minutes=$AGE_MIN"
+            else
+              echo "run_start_field=$RUN_FIELD run_start=$RUN_START (unparsable, age unavailable)"
+            fi
+          else
+            echo "run_age=unavailable: no run-start field found in machine object; auto-rotation skipped"
+          fi
+          run_exec
+          ROTATE=0
+          if [ "$MODE" = "rotate" ]; then echo "mode=rotate: forcing rotation"; ROTATE=1;
+          elif [ -n "$AGE_MIN" ] && [ "$AGE_MIN" -ge 450 ]; then echo "run age $AGE_MIN >= 450: rotating"; ROTATE=1; fi
+          if [ "$ROTATE" = "1" ]; then
+            echo "--- suspend ---"
+            curl -sS -X POST "$API/suspend" -H "X-API-Key: $INSTABOX_API_KEY" -H "Idempotency-Key: keepalive-${GITHUB_RUN_ID}-suspend" -o suspend.json -w 'suspend HTTP %{http_code}\n'
+            cat suspend.json; echo
+            echo "waiting ~15 seconds before resume"
+            sleep 15
+            echo "--- resume ---"
+            curl -sS -X POST "$API/resume" -H "X-API-Key: $INSTABOX_API_KEY" -H "Idempotency-Key: keepalive-${GITHUB_RUN_ID}-resume" -o resume2.json -w 'resume HTTP %{http_code}\n'
+            cat resume2.json; echo
+            wait_running
+            run_exec
+          else
+            echo "rotation skipped (mode=$MODE, age=${AGE_MIN:-unavailable})"
+          fi
+          get_machine
+          echo "final_state=$(jq -r '.state // "unknown"' machine.json)"
